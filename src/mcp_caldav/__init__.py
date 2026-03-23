@@ -1,100 +1,92 @@
-"""MCP CalDAV Server - Calendar integration for MCP."""
+"""MCP CalDAV Server — multi-tenant calendar integration for MCP.
 
-import asyncio
+Supports CalDAV (read/write) and ICS feeds (read-only) with per-user
+credential lookup from PostgreSQL, Redis-backed caching, and rate limiting.
+"""
+
+from __future__ import annotations
+
 import logging
 import os
 
 import click
 from dotenv import load_dotenv
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"
 
-# Initialize logging
-logging_level = logging.WARNING
+# Logging setup.
+_log_level = logging.WARNING
 if os.getenv("MCP_VERBOSE", "").lower() in ("true", "1", "yes"):
-    logging_level = logging.DEBUG
+    _log_level = logging.DEBUG
 
 logging.basicConfig(
-    level=logging_level,
+    level=_log_level,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("mcp-caldav")
 
 
 @click.command()
+@click.option("-v", "--verbose", count=True, help="Increase verbosity")
 @click.option(
-    "-v",
-    "--verbose",
-    count=True,
-    help="Increase verbosity (can be used multiple times)",
-)
-@click.option(
-    "--env-file",
-    type=click.Path(exists=True, dir_okay=False),
-    help="Path to .env file",
+    "--env-file", type=click.Path(exists=True, dir_okay=False), help="Path to .env file"
 )
 @click.option(
     "--transport",
-    type=click.Choice(["stdio", "sse"]),
-    default="stdio",
-    help="Transport type (stdio or sse)",
+    type=click.Choice(["stdio", "streamable-http"]),
+    default="streamable-http",
+    help="Transport type",
 )
-@click.option(
-    "--port",
-    default=8000,
-    help="Port to listen on for SSE transport",
-)
-@click.option(
-    "--caldav-url",
-    help="CalDAV server URL (e.g., https://caldav.example.com/)",
-)
-@click.option("--caldav-username", help="CalDAV username")
-@click.option("--caldav-password", help="CalDAV password or app password")
+@click.option("--host", default="0.0.0.0", help="Listen host")
+@click.option("--port", default=8025, type=int, help="Listen port")
 def main(
-    verbose: bool,
+    verbose: int,
     env_file: str | None,
     transport: str,
+    host: str,
     port: int,
-    caldav_url: str | None,
-    caldav_username: str | None,
-    caldav_password: str | None,
 ) -> None:
-    """MCP CalDAV Server - Universal calendar functionality for MCP
-
-    Works with any CalDAV-compatible calendar server.
-    """
-    # Configure logging based on verbosity
-    logging_level = logging.WARNING
+    """MCP CalDAV Server — multi-tenant calendar integration."""
     if verbose == 1:
-        logging_level = logging.INFO
+        logging.getLogger("mcp-caldav").setLevel(logging.INFO)
     elif verbose >= 2:
-        logging_level = logging.DEBUG
+        logging.getLogger("mcp-caldav").setLevel(logging.DEBUG)
 
-    logging.getLogger("mcp-caldav").setLevel(logging_level)
-
-    # Load environment variables from file if specified
     if env_file:
-        logger.debug(f"Loading environment from file: {env_file}")
         load_dotenv(env_file)
     else:
-        logger.debug("Attempting to load environment from default .env file")
         load_dotenv()
 
-    # Set environment variables from command line arguments if provided
-    if caldav_url:
-        os.environ["CALDAV_URL"] = caldav_url
-    if caldav_username:
-        os.environ["CALDAV_USERNAME"] = caldav_username
-    if caldav_password:
-        os.environ["CALDAV_PASSWORD"] = caldav_password
+    if transport == "streamable-http":
+        import uvicorn
 
-    from . import server
+        uvicorn.run(
+            "mcp_caldav.app:app",
+            host=host,
+            port=port,
+            log_level="info",
+        )
+    else:
+        # Legacy stdio mode (single-user, env-var config).
+        import asyncio
 
-    # Run the server with specified transport
-    asyncio.run(server.run_server(transport=transport, port=port))
+        asyncio.run(_run_stdio())
 
 
-__all__ = ["__version__", "main", "server"]
+async def _run_stdio() -> None:
+    """Run in stdio mode for local/dev use (single-user, env-var credentials)."""
+    from mcp.server.stdio import stdio_server
+
+    from .server import create_mcp_server
+
+    mcp_server = create_mcp_server()
+    async with stdio_server() as (read_stream, write_stream):
+        await mcp_server.run(
+            read_stream, write_stream, mcp_server.create_initialization_options()
+        )
+
+
+__all__ = ["__version__", "main"]
 
 if __name__ == "__main__":
     main()

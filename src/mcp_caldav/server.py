@@ -1,11 +1,19 @@
-"""MCP server for CalDAV calendar integration."""
+"""Multi-tenant MCP server for CalDAV and ICS calendar integration.
+
+Runs as a Streamable HTTP server.  On every request it reads the
+authenticated user ID from a configurable HTTP header (default:
+``X-Dialogue-User-Id``), looks up that user's calendar sources from
+PostgreSQL, and dispatches the appropriate CalDAV or ICS client calls.
+
+Rate limiting is enforced per-user via the ``limits`` library with a
+Redis backing store.
+"""
+
+from __future__ import annotations
 
 import json
 import logging
-import os
-from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
@@ -13,102 +21,146 @@ from mcp.server import Server
 from mcp.types import TextContent, Tool
 
 from .client import CalDAVClient
+from .database import decrypt_password, get_user_sources
+from .models import CalendarSource
 
-# Configure logging
-logger = logging.getLogger("mcp-caldav")
-
-
-@dataclass
-class AppContext:
-    """Application context for MCP CalDAV."""
-
-    client: CalDAVClient | None = None
+logger = logging.getLogger("mcp-caldav.server")
 
 
-def get_caldav_config() -> dict[str, str | None]:
-    """Get CalDAV configuration from environment variables."""
-    return {
-        "url": os.getenv("CALDAV_URL"),  # No default - must be configured
-        "username": os.getenv("CALDAV_USERNAME")
-        or os.getenv("YANDEX_USERNAME"),  # Backward compatibility
-        "password": os.getenv("CALDAV_PASSWORD")
-        or os.getenv("YANDEX_PASSWORD"),  # Backward compatibility
-    }
+# ── Tool definitions ────────────────────────────────────────────────
 
 
-@asynccontextmanager
-async def server_lifespan(server: Server) -> AsyncIterator[AppContext]:  # noqa: ARG001
-    """Initialize and clean up application resources."""
-    config = get_caldav_config()
-
-    try:
-        client = None
-        if config["url"] and config["username"] and config["password"]:
-            client = CalDAVClient(
-                url=config["url"],
-                username=config["username"],
-                password=config["password"],
-            )
-            client.connect()
-            logger.info(
-                f"Connected to CalDAV server: {config['url']} "
-                f"for user: {config['username']}"
-            )
-        else:
-            missing = []
-            if not config["url"]:
-                missing.append("CALDAV_URL")
-            if not config["username"]:
-                missing.append("CALDAV_USERNAME")
-            if not config["password"]:
-                missing.append("CALDAV_PASSWORD")
-            logger.warning(
-                f"CalDAV not configured. Missing: {', '.join(missing)}. "
-                "Set these environment variables to enable calendar functionality."
-            )
-
-        yield AppContext(client=client)
-    finally:
-        # Cleanup if needed
-        pass
-
-
-# Create server instance
-app = Server("mcp-caldav", lifespan=server_lifespan)
-
-
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    """List available CalDAV tools."""
-    ctx = app.request_context.lifespan_context
-
-    if not ctx or not ctx.client:
-        return []
-
-    tools = [
+def _read_tools() -> list[Tool]:
+    """Tools available for any source (read-only)."""
+    return [
         Tool(
-            name="caldav_list_calendars",
-            description="List all available calendars",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-            },
+            name="calendar_list_sources",
+            description="List all configured calendar sources with their capabilities (read-only vs read-write)",
+            inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
-            name="caldav_create_event",
-            description="Create a new event in the calendar",
+            name="calendar_get_events",
+            description="Get events from a specific source (or all sources) for a date range",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "calendar_index": {
-                        "type": "integer",
-                        "description": "Index of the calendar (default: 0)",
-                        "default": 0,
-                    },
-                    "title": {
+                    "source_name": {
                         "type": "string",
-                        "description": "Event title",
+                        "description": "Name of the calendar source (omit to query all sources)",
                     },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date in ISO format (defaults to today 00:00 UTC)",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date in ISO format (defaults to 7 days from start)",
+                    },
+                    "include_all_day": {
+                        "type": "boolean",
+                        "description": "Include all-day events (default: true)",
+                        "default": True,
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="calendar_get_today_events",
+            description="Get all events for today across all calendar sources",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_name": {
+                        "type": "string",
+                        "description": "Name of a specific source (omit for all)",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="calendar_get_week_events",
+            description="Get all events for the current week across all sources",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_name": {
+                        "type": "string",
+                        "description": "Name of a specific source (omit for all)",
+                    },
+                    "start_from_today": {
+                        "type": "boolean",
+                        "description": "Start from today (true) or Monday (false)",
+                        "default": True,
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="calendar_search_events",
+            description="Search events by text, attendees, or location",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_name": {
+                        "type": "string",
+                        "description": "Name of a specific source (omit for all)",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query string",
+                    },
+                    "search_fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["title", "description", "location", "attendees"],
+                        },
+                        "description": "Fields to search (default: all)",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date in ISO format",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date in ISO format",
+                    },
+                },
+                "required": ["start_date", "end_date"],
+            },
+        ),
+        Tool(
+            name="calendar_get_event_by_uid",
+            description="Get a specific event by its UID",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_name": {
+                        "type": "string",
+                        "description": "Name of the source to search in",
+                    },
+                    "uid": {"type": "string", "description": "Event UID"},
+                },
+                "required": ["source_name", "uid"],
+            },
+        ),
+    ]
+
+
+def _write_tools() -> list[Tool]:
+    """Tools only available for read-write CalDAV sources."""
+    return [
+        Tool(
+            name="calendar_create_event",
+            description="Create a new event on a read-write CalDAV calendar",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_name": {
+                        "type": "string",
+                        "description": "Name of the CalDAV source (must be read-write)",
+                    },
+                    "title": {"type": "string", "description": "Event title"},
                     "description": {
                         "type": "string",
                         "description": "Event description",
@@ -121,24 +173,20 @@ async def list_tools() -> list[Tool]:
                     },
                     "start_time": {
                         "type": "string",
-                        "description": "Start time in ISO format (e.g., '2025-01-20T14:00:00'). "
-                        "If not provided, defaults to tomorrow at 14:00",
+                        "description": "Start time ISO format (default: tomorrow 14:00 UTC)",
                     },
                     "end_time": {
                         "type": "string",
-                        "description": "End time in ISO format (e.g., '2025-01-20T15:00:00'). "
-                        "If not provided, uses duration_hours from start_time",
+                        "description": "End time ISO format (uses duration_hours if omitted)",
                     },
-                    "duration_hours": {
-                        "type": "number",
-                        "description": "Duration in hours (used if end_time not provided)",
-                        "default": 1.0,
+                    "duration_hours": {"type": "number", "default": 1.0},
+                    "calendar_index": {
+                        "type": "integer",
+                        "description": "Index of the calendar within this source (default: 0)",
+                        "default": 0,
                     },
                     "reminders": {
                         "type": "array",
-                        "description": "List of reminders. Each reminder is an object with: "
-                        "minutes_before (integer), action ('DISPLAY', 'EMAIL', or 'AUDIO'), "
-                        "and optional description (string)",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -154,7 +202,6 @@ async def list_tools() -> list[Tool]:
                     },
                     "attendees": {
                         "type": "array",
-                        "description": "List of attendee email addresses (strings) or objects with 'email' and 'status' (ACCEPTED/DECLINED/TENTATIVE/NEEDS-ACTION)",
                         "items": {
                             "oneOf": [
                                 {"type": "string"},
@@ -174,481 +221,384 @@ async def list_tools() -> list[Tool]:
                                     },
                                     "required": ["email"],
                                 },
-                            ]
+                            ],
                         },
                     },
-                    "categories": {
-                        "type": "array",
-                        "description": "List of category/tag strings",
-                        "items": {"type": "string"},
-                    },
-                    "priority": {
-                        "type": "integer",
-                        "description": "Priority 0-9 (0 = highest, 9 = lowest)",
-                        "minimum": 0,
-                        "maximum": 9,
-                    },
+                    "categories": {"type": "array", "items": {"type": "string"}},
+                    "priority": {"type": "integer", "minimum": 0, "maximum": 9},
                     "recurrence": {
                         "type": "object",
-                        "description": "Recurrence rule for repeating events",
                         "properties": {
                             "frequency": {
                                 "type": "string",
                                 "enum": ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"],
-                                "description": "How often the event repeats",
                             },
-                            "interval": {
-                                "type": "integer",
-                                "description": "Interval between occurrences (default: 1)",
-                                "default": 1,
-                            },
-                            "count": {
-                                "type": "integer",
-                                "description": "Number of occurrences",
-                            },
-                            "until": {
-                                "type": "string",
-                                "description": "End date in ISO format",
-                            },
-                            "byday": {
-                                "type": "string",
-                                "description": "Days of week (e.g., 'MO,WE,FR' for Monday, Wednesday, Friday)",
-                            },
-                            "bymonthday": {
-                                "type": "integer",
-                                "description": "Day of month (1-31)",
-                            },
-                            "bymonth": {
-                                "type": "integer",
-                                "description": "Month (1-12)",
-                            },
+                            "interval": {"type": "integer", "default": 1},
+                            "count": {"type": "integer"},
+                            "until": {"type": "string"},
+                            "byday": {"type": "string"},
+                            "bymonthday": {"type": "integer"},
+                            "bymonth": {"type": "integer"},
                         },
                         "required": ["frequency"],
                     },
                 },
-                "required": ["title"],
+                "required": ["source_name", "title"],
             },
         ),
         Tool(
-            name="caldav_get_event_by_uid",
-            description="Get a specific event by its UID",
+            name="calendar_delete_event",
+            description="Delete an event by UID from a read-write CalDAV calendar",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "uid": {
+                    "source_name": {
                         "type": "string",
-                        "description": "Event UID",
+                        "description": "Name of the CalDAV source",
                     },
-                    "calendar_index": {
-                        "type": "integer",
-                        "description": "Index of the calendar (default: 0)",
-                        "default": 0,
-                    },
+                    "uid": {"type": "string", "description": "Event UID to delete"},
+                    "calendar_index": {"type": "integer", "default": 0},
                 },
-                "required": ["uid"],
-            },
-        ),
-        Tool(
-            name="caldav_delete_event",
-            description="Delete an event by its UID",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "uid": {
-                        "type": "string",
-                        "description": "Event UID to delete",
-                    },
-                    "calendar_index": {
-                        "type": "integer",
-                        "description": "Index of the calendar (default: 0)",
-                        "default": 0,
-                    },
-                },
-                "required": ["uid"],
-            },
-        ),
-        Tool(
-            name="caldav_search_events",
-            description="Search events by text, attendees, or location",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "calendar_index": {
-                        "type": "integer",
-                        "description": "Index of the calendar (default: 0)",
-                        "default": 0,
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Search query string",
-                    },
-                    "search_fields": {
-                        "type": "array",
-                        "description": "Fields to search in: 'title', 'description', 'location', 'attendees'. If not provided, searches in all fields",
-                        "items": {
-                            "type": "string",
-                            "enum": ["title", "description", "location", "attendees"],
-                        },
-                    },
-                    "start_date": {
-                        "type": "string",
-                        "description": "Start date for search period in ISO format",
-                    },
-                    "end_date": {
-                        "type": "string",
-                        "description": "End date for search period in ISO format",
-                    },
-                },
-                "required": ["start_date", "end_date"],
-            },
-        ),
-        Tool(
-            name="caldav_get_events",
-            description="Get events from calendar for a specified period",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "calendar_index": {
-                        "type": "integer",
-                        "description": "Index of the calendar (default: 0)",
-                        "default": 0,
-                    },
-                    "start_date": {
-                        "type": "string",
-                        "description": "Start date in ISO format (e.g., '2025-01-20T00:00:00'). "
-                        "Defaults to today 00:00",
-                    },
-                    "end_date": {
-                        "type": "string",
-                        "description": "End date in ISO format (e.g., '2025-01-27T23:59:59'). "
-                        "Defaults to 7 days from start_date",
-                    },
-                    "include_all_day": {
-                        "type": "boolean",
-                        "description": "Include all-day events",
-                        "default": True,
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="caldav_get_today_events",
-            description="Get all events for today",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "calendar_index": {
-                        "type": "integer",
-                        "description": "Index of the calendar (default: 0)",
-                        "default": 0,
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="caldav_get_week_events",
-            description="Get all events for the week",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "calendar_index": {
-                        "type": "integer",
-                        "description": "Index of the calendar (default: 0)",
-                        "default": 0,
-                    },
-                    "start_from_today": {
-                        "type": "boolean",
-                        "description": "Start from today (True) or from Monday (False)",
-                        "default": True,
-                    },
-                },
+                "required": ["source_name", "uid"],
             },
         ),
     ]
 
-    return tools
+
+# ── Helper: connect to a CalDAV source ──────────────────────────────
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
-    """Handle tool calls for CalDAV operations."""
-    ctx = app.request_context.lifespan_context
+def _connect_caldav(source: CalendarSource) -> CalDAVClient:
+    """Create and connect a CalDAVClient for a database source row."""
+    password = decrypt_password(source.encrypted_password)
+    if not password:
+        raise RuntimeError(f"Cannot decrypt password for source '{source.name}'")
+    client = CalDAVClient(
+        url=source.url,
+        username=source.username or "",
+        password=password,
+    )
+    client.connect()
+    return client
 
-    if not ctx or not ctx.client:
-        config = get_caldav_config()
-        missing = []
-        if not config.get("url"):
-            missing.append("CALDAV_URL")
-        if not config.get("username"):
-            missing.append("CALDAV_USERNAME")
-        if not config.get("password"):
-            missing.append("CALDAV_PASSWORD")
 
-        message = "CalDAV client not configured."
-        if missing:
-            message += f" Missing variables: {', '.join(missing)}."
-        else:
-            message += (
-                " Please configure CALDAV_URL, CALDAV_USERNAME, and CALDAV_PASSWORD."
-            )
+def _parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-        return [
-            TextContent(
-                type="text",
-                text=json.dumps({"error": message}, indent=2, ensure_ascii=False),
-            )
+
+def _json_text(data: Any) -> TextContent:
+    return TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))
+
+
+# ── MCP Server factory ──────────────────────────────────────────────
+
+
+def create_mcp_server() -> Server:
+    """Build the MCP ``Server`` instance with tool handlers.
+
+    This function registers tools and the ``call_tool`` handler.
+    The server itself is stateless — all per-user state is loaded on
+    each request from the database.
+    """
+    app = Server("mcp-caldav")
+
+    @app.list_tools()
+    async def list_tools() -> list[Tool]:
+        """Return the full set of tools.
+
+        We always advertise both read and write tools.  Write tool calls
+        against read-only sources return a clear error message rather
+        than hiding the tools (which would require a per-session DB
+        lookup at list_tools time).
+        """
+        return _read_tools() + _write_tools()
+
+    @app.call_tool()
+    async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextContent]:
+        """Dispatch a tool call.
+
+        The ``user_id`` is extracted from the MCP request context by the
+        transport layer (see ``app.py``) and threaded through the server's
+        ``request_context``.
+        """
+        # Retrieve user_id from request context (set by transport layer).
+        ctx = app.request_context
+        user_id: str | None = None
+        if ctx and hasattr(ctx, "lifespan_context") and ctx.lifespan_context:
+            user_id = getattr(ctx.lifespan_context, "user_id", None)
+
+        if not user_id:
+            return [
+                _json_text({"error": "No authenticated user — missing user ID header"})
+            ]
+
+        try:
+            sources = await get_user_sources(user_id)
+        except Exception as e:
+            logger.error("Failed to load calendar sources for user %s: %s", user_id, e)
+            return [_json_text({"error": f"Failed to load calendar sources: {e}"})]
+
+        if not sources and name != "calendar_list_sources":
+            return [
+                _json_text(
+                    {
+                        "error": "No calendar sources configured. Add sources in Settings > Integrations."
+                    }
+                )
+            ]
+
+        try:
+            return await _dispatch(name, arguments, sources)
+        except Exception as e:
+            logger.error("Tool %s failed: %s", name, e, exc_info=True)
+            return [_json_text({"error": str(e)})]
+
+    return app
+
+
+# ── Tool dispatch ───────────────────────────────────────────────────
+
+
+async def _dispatch(
+    name: str, args: dict[str, Any], sources: list[CalendarSource]
+) -> Sequence[TextContent]:
+    """Route a tool call to the correct handler."""
+    from . import ics_client
+
+    source_name: str | None = args.get("source_name")
+
+    # ── calendar_list_sources ───────────────────────────────────────
+    if name == "calendar_list_sources":
+        info = [
+            {
+                "name": s.name,
+                "type": s.source_type,
+                "url": s.url,
+                "capability": s.capability,
+                "enabled": s.enabled,
+            }
+            for s in sources
         ]
+        return [_json_text(info)]
 
-    try:
-        if name == "caldav_list_calendars":
-            calendars = ctx.client.list_calendars()
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(calendars, indent=2, ensure_ascii=False),
-                )
-            ]
-
-        elif name == "caldav_create_event":
-            calendar_index = arguments.get("calendar_index", 0)
-            title = arguments.get("title")
-            description = arguments.get("description", "")
-            location = arguments.get("location", "")
-            start_time_str = arguments.get("start_time")
-            end_time_str = arguments.get("end_time")
-            duration_hours = arguments.get("duration_hours", 1.0)
-            reminders = arguments.get("reminders")
-            attendees = arguments.get("attendees")
-            categories = arguments.get("categories")
-            priority = arguments.get("priority")
-            recurrence = arguments.get("recurrence")
-
-            start_time = None
-            if start_time_str:
-                start_time = datetime.fromisoformat(
-                    start_time_str.replace("Z", "+00:00")
-                )
-
-            end_time = None
-            if end_time_str:
-                end_time = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
-
-            # Parse recurrence until date if provided
-            if recurrence and recurrence.get("until"):
-                until_str = recurrence["until"]
-                try:
-                    recurrence["until"] = datetime.fromisoformat(
-                        until_str.replace("Z", "+00:00")
-                    )
-                except ValueError:
-                    # Try date format
-                    from contextlib import suppress
-
-                    with suppress(ValueError):
-                        recurrence["until"] = datetime.fromisoformat(until_str).date()
-
-            result = ctx.client.create_event(
-                calendar_index=calendar_index,
-                title=title,
-                description=description,
-                location=location,
-                start_time=start_time,
-                end_time=end_time,
-                duration_hours=duration_hours,
-                reminders=reminders,
-                attendees=attendees,
-                categories=categories,
-                priority=priority,
-                recurrence=recurrence,
-            )
-
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(result, indent=2, ensure_ascii=False),
-                )
-            ]
-
-        elif name == "caldav_get_events":
-            calendar_index = arguments.get("calendar_index", 0)
-            start_date_str = arguments.get("start_date")
-            end_date_str = arguments.get("end_date")
-            include_all_day = arguments.get("include_all_day", True)
-
-            start_date = None
-            if start_date_str:
-                start_date = datetime.fromisoformat(
-                    start_date_str.replace("Z", "+00:00")
-                )
-            end_date = None
-            if end_date_str:
-                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-
-            events = ctx.client.get_events(
-                calendar_index=calendar_index,
-                start_date=start_date,
-                end_date=end_date,
-                include_all_day=include_all_day,
-            )
-
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(events, indent=2, ensure_ascii=False),
-                )
-            ]
-
-        elif name == "caldav_get_today_events":
-            calendar_index = arguments.get("calendar_index", 0)
-            events = ctx.client.get_today_events(calendar_index=calendar_index)
-
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(events, indent=2, ensure_ascii=False),
-                )
-            ]
-
-        elif name == "caldav_get_week_events":
-            calendar_index = arguments.get("calendar_index", 0)
-            start_from_today = arguments.get("start_from_today", True)
-            events = ctx.client.get_week_events(
-                calendar_index=calendar_index, start_from_today=start_from_today
-            )
-
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(events, indent=2, ensure_ascii=False),
-                )
-            ]
-
-        elif name == "caldav_get_event_by_uid":
-            uid = arguments.get("uid")
-            calendar_index = arguments.get("calendar_index", 0)
-
-            event = ctx.client.get_event_by_uid(uid=uid, calendar_index=calendar_index)
-
-            if event:
-                return [
-                    TextContent(
-                        type="text",
-                        text=json.dumps(event, indent=2, ensure_ascii=False),
-                    )
-                ]
-            else:
-                return [
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {"error": f"Event with UID {uid} not found"}, indent=2
-                        ),
-                    )
-                ]
-
-        elif name == "caldav_delete_event":
-            uid = arguments.get("uid")
-            calendar_index = arguments.get("calendar_index", 0)
-
-            result = ctx.client.delete_event(uid=uid, calendar_index=calendar_index)
-
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(result, indent=2, ensure_ascii=False),
-                )
-            ]
-
-        elif name == "caldav_search_events":
-            calendar_index = arguments.get("calendar_index", 0)
-            query = arguments.get("query")
-            search_fields = arguments.get("search_fields")
-            start_date_str = arguments.get("start_date")
-            end_date_str = arguments.get("end_date")
-
-            if not start_date_str or not end_date_str:
+    # ── Helper to filter sources by name ────────────────────────────
+    def _get_sources(name_filter: str | None) -> list[CalendarSource]:
+        if name_filter:
+            matched = [s for s in sources if s.name == name_filter]
+            if not matched:
                 raise ValueError(
-                    "caldav_search_events requires both start_date and end_date arguments."
+                    f"No calendar source named '{name_filter}'. Available: {[s.name for s in sources]}"
                 )
+            return matched
+        return sources
 
-            start_date = None
-            if start_date_str:
-                start_date = datetime.fromisoformat(
-                    start_date_str.replace("Z", "+00:00")
-                )
+    # ── calendar_get_events ─────────────────────────────────────────
+    if name == "calendar_get_events":
+        target_sources = _get_sources(source_name)
+        start = _parse_iso(args.get("start_date"))
+        end = _parse_iso(args.get("end_date"))
+        include_all_day = args.get("include_all_day", True)
 
-            end_date = None
-            if end_date_str:
-                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+        all_events: list[dict[str, Any]] = []
+        for src in target_sources:
+            try:
+                if src.source_type == "ics":
+                    events = await ics_client.get_events(src.url, start, end)
+                else:
+                    client = _connect_caldav(src)
+                    events = client.get_events(
+                        start_date=start, end_date=end, include_all_day=include_all_day
+                    )
+                for ev in events:
+                    ev["source"] = src.name
+                all_events.extend(events)
+            except Exception as e:
+                all_events.append({"source": src.name, "error": str(e)})
 
-            events = ctx.client.search_events(
-                calendar_index=calendar_index,
-                query=query,
-                search_fields=search_fields,
-                start_date=start_date,
-                end_date=end_date,
-            )
+        all_events.sort(key=lambda x: x.get("start", ""))
+        return [_json_text(all_events)]
 
+    # ── calendar_get_today_events ───────────────────────────────────
+    if name == "calendar_get_today_events":
+        target_sources = _get_sources(source_name)
+        all_events = []
+        for src in target_sources:
+            try:
+                if src.source_type == "ics":
+                    from datetime import datetime as dt, timedelta, timezone
+
+                    now = dt.now(tz=timezone.utc)
+                    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    events = await ics_client.get_events(
+                        src.url, start, start + timedelta(days=1)
+                    )
+                else:
+                    client = _connect_caldav(src)
+                    events = client.get_today_events()
+                for ev in events:
+                    ev["source"] = src.name
+                all_events.extend(events)
+            except Exception as e:
+                all_events.append({"source": src.name, "error": str(e)})
+        all_events.sort(key=lambda x: x.get("start", ""))
+        return [_json_text(all_events)]
+
+    # ── calendar_get_week_events ────────────────────────────────────
+    if name == "calendar_get_week_events":
+        target_sources = _get_sources(source_name)
+        start_from_today = args.get("start_from_today", True)
+        all_events = []
+        for src in target_sources:
+            try:
+                if src.source_type == "ics":
+                    from datetime import datetime as dt, timedelta, timezone
+
+                    now = dt.now(tz=timezone.utc)
+                    if start_from_today:
+                        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    else:
+                        start = (now - timedelta(days=now.weekday())).replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        )
+                    events = await ics_client.get_events(
+                        src.url, start, start + timedelta(days=7)
+                    )
+                else:
+                    client = _connect_caldav(src)
+                    events = client.get_week_events(start_from_today=start_from_today)
+                for ev in events:
+                    ev["source"] = src.name
+                all_events.extend(events)
+            except Exception as e:
+                all_events.append({"source": src.name, "error": str(e)})
+        all_events.sort(key=lambda x: x.get("start", ""))
+        return [_json_text(all_events)]
+
+    # ── calendar_search_events ──────────────────────────────────────
+    if name == "calendar_search_events":
+        target_sources = _get_sources(source_name)
+        start = _parse_iso(args.get("start_date"))
+        end = _parse_iso(args.get("end_date"))
+        query = args.get("query")
+        search_fields = args.get("search_fields")
+
+        if not start or not end:
+            return [_json_text({"error": "start_date and end_date are required"})]
+
+        all_events = []
+        for src in target_sources:
+            try:
+                if src.source_type == "ics":
+                    events = await ics_client.search_events(
+                        src.url, start, end, query, search_fields
+                    )
+                else:
+                    client = _connect_caldav(src)
+                    events = client.search_events(
+                        query=query,
+                        search_fields=search_fields,
+                        start_date=start,
+                        end_date=end,
+                    )
+                for ev in events:
+                    ev["source"] = src.name
+                all_events.extend(events)
+            except Exception as e:
+                all_events.append({"source": src.name, "error": str(e)})
+        return [_json_text(all_events)]
+
+    # ── calendar_get_event_by_uid ───────────────────────────────────
+    if name == "calendar_get_event_by_uid":
+        if not source_name:
             return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(events, indent=2, ensure_ascii=False),
+                _json_text({"error": "source_name is required for get_event_by_uid"})
+            ]
+        target = _get_sources(source_name)[0]
+        uid = args.get("uid", "")
+        if target.source_type == "ics":
+            return [
+                _json_text(
+                    {
+                        "error": "get_event_by_uid is not supported for ICS feeds — use calendar_search_events instead"
+                    }
                 )
             ]
-
-        else:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({"error": f"Unknown tool: {name}"}, indent=2),
-                )
-            ]
-
-    except Exception as e:
-        logger.error(f"Error calling tool {name}: {e}", exc_info=True)
+        client = _connect_caldav(target)
+        event = client.get_event_by_uid(uid)
+        if event:
+            event["source"] = target.name  # type: ignore[index]
+            return [_json_text(event)]
         return [
-            TextContent(
-                type="text",
-                text=json.dumps({"error": str(e)}, indent=2),
-            )
+            _json_text({"error": f"Event {uid} not found in source '{source_name}'"})
         ]
 
-
-async def run_server(transport: str = "stdio", port: int = 8000) -> None:
-    """Run the MCP CalDAV server with the specified transport."""
-    if transport == "sse":
-        from mcp.server.sse import SseServerTransport
-        from starlette.applications import Starlette
-        from starlette.requests import Request
-        from starlette.routing import Mount, Route
-
-        sse = SseServerTransport("/messages/")
-
-        async def handle_sse(request: Request) -> None:
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send
-            ) as streams:
-                await app.run(
-                    streams[0], streams[1], app.create_initialization_options()
+    # ── calendar_create_event ───────────────────────────────────────
+    if name == "calendar_create_event":
+        if not source_name:
+            return [_json_text({"error": "source_name is required for create_event"})]
+        target = _get_sources(source_name)[0]
+        if target.source_type == "ics":
+            return [
+                _json_text(
+                    {
+                        "error": f"Source '{source_name}' is an ICS subscription (read-only). Cannot create events."
+                    }
                 )
+            ]
+        if target.capability != "readwrite":
+            return [
+                _json_text(
+                    {
+                        "error": f"Source '{source_name}' is read-only. Cannot create events."
+                    }
+                )
+            ]
 
-        starlette_app = Starlette(
-            debug=True,
-            routes=[
-                Route("/sse", endpoint=handle_sse),
-                Mount("/messages/", app=sse.handle_post_message),
-            ],
+        client = _connect_caldav(target)
+        result = client.create_event(
+            calendar_index=args.get("calendar_index", 0),
+            title=args.get("title", "Event"),
+            description=args.get("description", ""),
+            location=args.get("location", ""),
+            start_time=_parse_iso(args.get("start_time")),
+            end_time=_parse_iso(args.get("end_time")),
+            duration_hours=args.get("duration_hours", 1.0),
+            reminders=args.get("reminders"),
+            attendees=args.get("attendees"),
+            categories=args.get("categories"),
+            priority=args.get("priority"),
+            recurrence=args.get("recurrence"),
         )
+        return [_json_text(result)]
 
-        import uvicorn
+    # ── calendar_delete_event ───────────────────────────────────────
+    if name == "calendar_delete_event":
+        if not source_name:
+            return [_json_text({"error": "source_name is required for delete_event"})]
+        target = _get_sources(source_name)[0]
+        if target.source_type == "ics":
+            return [
+                _json_text(
+                    {
+                        "error": f"Source '{source_name}' is an ICS subscription (read-only). Cannot delete events."
+                    }
+                )
+            ]
+        if target.capability != "readwrite":
+            return [
+                _json_text(
+                    {
+                        "error": f"Source '{source_name}' is read-only. Cannot delete events."
+                    }
+                )
+            ]
 
-        config = uvicorn.Config(starlette_app, host="0.0.0.0", port=port)
-        server = uvicorn.Server(config)
-        await server.serve()
-    else:
-        from mcp.server.stdio import stdio_server
+        client = _connect_caldav(target)
+        result = client.delete_event(
+            uid=args["uid"], calendar_index=args.get("calendar_index", 0)
+        )
+        return [_json_text(result)]
 
-        async with stdio_server() as (read_stream, write_stream):
-            await app.run(
-                read_stream, write_stream, app.create_initialization_options()
-            )
+    return [_json_text({"error": f"Unknown tool: {name}"})]
