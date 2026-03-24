@@ -91,6 +91,9 @@ mcp = FastMCP(
     stateless_http=True,
 )
 
+# ASGI app for uvicorn — just the MCP server on its own port.
+mcp_asgi_app = mcp.streamable_http_app()
+
 
 # ── Read tools ──────────────────────────────────────────────────────
 

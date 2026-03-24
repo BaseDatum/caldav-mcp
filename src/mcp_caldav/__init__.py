@@ -1,7 +1,8 @@
 """MCP CalDAV Server — multi-tenant calendar integration for MCP.
 
-Supports CalDAV (read/write) and ICS feeds (read-only) with per-user
-credential lookup from PostgreSQL, Redis-backed caching, and rate limiting.
+Two processes:
+  - Port 8025: FastMCP streamable-http server (MCP tools)
+  - Port 8026: FastAPI REST server (service-to-service event queries)
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from dotenv import load_dotenv
 
 __version__ = "2.0.0"
 
-# Logging setup.
 _log_level = logging.WARNING
 if os.getenv("MCP_VERBOSE", "").lower() in ("true", "1", "yes"):
     _log_level = logging.DEBUG
@@ -35,16 +35,17 @@ logger = logging.getLogger("mcp-caldav")
     "--transport",
     type=click.Choice(["stdio", "streamable-http"]),
     default="streamable-http",
-    help="Transport type",
 )
 @click.option("--host", default="0.0.0.0", help="Listen host")
-@click.option("--port", default=8025, type=int, help="Listen port")
+@click.option("--port", default=8025, type=int, help="MCP server port")
+@click.option("--api-port", default=8026, type=int, help="REST API port")
 def main(
     verbose: int,
     env_file: str | None,
     transport: str,
     host: str,
     port: int,
+    api_port: int,
 ) -> None:
     """MCP CalDAV Server — multi-tenant calendar integration."""
     if verbose == 1:
@@ -57,20 +58,53 @@ def main(
     else:
         load_dotenv()
 
-    if transport == "streamable-http":
-        import uvicorn
+    if transport == "stdio":
+        from .server import mcp
 
-        uvicorn.run(
-            "mcp_caldav.app:app",
-            host=host,
-            port=port,
-            log_level="info",
-        )
+        mcp.run(transport="stdio")
     else:
-        # Legacy stdio mode (single-user, env-var config).
-        from .server import mcp as mcp_server
+        import asyncio
 
-        mcp_server.run(transport="stdio")
+        asyncio.run(_run_both(host, port, api_port))
+
+
+async def _run_both(host: str, mcp_port: int, api_port: int) -> None:
+    """Run both the MCP server and the REST API server concurrently."""
+    import uvicorn
+
+    from .database import init_db, close_db
+    from .ics_client import init_ics_cache
+    from .settings import Settings
+    import redis.asyncio as aioredis
+
+    # Shared init (DB + Redis) before starting either server.
+    settings = Settings()
+    await init_db(settings)
+    logger.info("Database initialised")
+
+    redis_client = aioredis.from_url(settings.redis_url, decode_responses=False)
+    init_ics_cache(redis_client, settings.ics_cache_ttl_seconds)
+    logger.info("Redis connected (%s)", settings.redis_url)
+
+    mcp_config = uvicorn.Config(
+        "mcp_caldav.server:mcp_asgi_app",
+        host=host,
+        port=mcp_port,
+        log_level="info",
+    )
+    api_config = uvicorn.Config(
+        "mcp_caldav.app:app",
+        host=host,
+        port=api_port,
+        log_level="info",
+    )
+
+    mcp_server = uvicorn.Server(mcp_config)
+    api_server = uvicorn.Server(api_config)
+
+    import asyncio
+
+    await asyncio.gather(mcp_server.serve(), api_server.serve())
 
 
 __all__ = ["__version__", "main"]
