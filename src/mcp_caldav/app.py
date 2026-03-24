@@ -67,8 +67,13 @@ async def _lifespan(app: Starlette) -> AsyncIterator[None]:
     logger.info("Redis connected (%s)", _settings.redis_url)
 
     # Rate limiter.
+    # The limits library requires "async+" prefix for async Redis storage,
+    # and we use the redispy implementation since we already depend on redis[hiredis].
     _rate_limit_item = parse_rate_limit(_settings.rate_limit)
-    storage = RedisStorage(_settings.redis_url)
+    async_redis_url = _settings.redis_url
+    if not async_redis_url.startswith("async+"):
+        async_redis_url = f"async+{async_redis_url}"
+    storage = RedisStorage(async_redis_url, implementation="redispy")
     _rate_limiter = FixedWindowRateLimiter(storage)
     logger.info("Rate limiter configured: %s", _settings.rate_limit)
 
