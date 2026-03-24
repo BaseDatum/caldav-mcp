@@ -38,6 +38,10 @@ _rate_limiter: FixedWindowRateLimiter | None = None
 _rate_limit_item = None
 _redis_client = None
 
+# Create the FastMCP sub-app once at module level so session_manager
+# is accessible in the lifespan.
+_mcp_http_app = mcp.streamable_http_app()
+
 
 # ── Lifespan ────────────────────────────────────────────────────────
 
@@ -67,7 +71,11 @@ async def _lifespan(app: Starlette) -> AsyncIterator[None]:
     _rate_limiter = FixedWindowRateLimiter(storage)
     logger.info("Rate limiter configured: %s", _settings.rate_limit)
 
-    yield
+    # Start the FastMCP session manager task group — required for
+    # handling incoming MCP requests over streamable HTTP.
+    async with mcp.session_manager.run():
+        logger.info("MCP session manager started")
+        yield
 
     # Shutdown.
     await close_db()
@@ -88,11 +96,6 @@ async def _health(request: Request) -> Response:
 
 def create_app() -> Starlette:
     """Create the Starlette ASGI application."""
-    # Get the FastMCP ASGI sub-app for Streamable HTTP transport.
-    # streamable_http_app() returns a Starlette app with a route at /mcp.
-    # Mount it at "/" so the MCP endpoint is at /mcp on the main app.
-    mcp_http_app = mcp.streamable_http_app()
-
     return Starlette(
         debug=False,
         lifespan=_lifespan,
@@ -103,7 +106,7 @@ def create_app() -> Starlette:
             Route("/api/sources", rest_list_sources, methods=["GET"]),
             # MCP Streamable HTTP — FastMCP sub-app serves /mcp internally.
             # Openfang connects to http://caldav-mcp:8025/mcp
-            Mount("/", app=mcp_http_app),
+            Mount("/", app=_mcp_http_app),
         ],
     )
 
