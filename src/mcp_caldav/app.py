@@ -89,9 +89,9 @@ async def _health(request: Request) -> Response:
 def create_app() -> Starlette:
     """Create the Starlette ASGI application."""
     # Get the FastMCP ASGI sub-app for Streamable HTTP transport.
-    # path="/" means the MCP endpoint is at the root of the sub-app,
-    # and Mount("/mcp", ...) puts it at /mcp on the main app.
-    mcp_http_app = mcp.http_app(path="/")
+    # streamable_http_app() returns a Starlette app with a route at /mcp.
+    # Mount it at "/" so the MCP endpoint is at /mcp on the main app.
+    mcp_http_app = mcp.streamable_http_app()
 
     return Starlette(
         debug=False,
@@ -101,9 +101,9 @@ def create_app() -> Starlette:
             # REST API — used by the api-server for unified calendar queries.
             Route("/api/events", rest_get_events, methods=["GET"]),
             Route("/api/sources", rest_list_sources, methods=["GET"]),
-            # MCP Streamable HTTP — mounted as a sub-application.
+            # MCP Streamable HTTP — FastMCP sub-app serves /mcp internally.
             # Openfang connects to http://caldav-mcp:8025/mcp
-            Mount("/mcp", app=mcp_http_app),
+            Mount("/", app=mcp_http_app),
         ],
     )
 
