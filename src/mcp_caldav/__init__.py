@@ -68,22 +68,9 @@ def main(
         )
     else:
         # Legacy stdio mode (single-user, env-var config).
-        import asyncio
+        from .server import mcp as mcp_server
 
-        asyncio.run(_run_stdio())
-
-
-async def _run_stdio() -> None:
-    """Run in stdio mode for local/dev use (single-user, env-var credentials)."""
-    from mcp.server.stdio import stdio_server
-
-    from .server import create_mcp_server
-
-    mcp_server = create_mcp_server()
-    async with stdio_server() as (read_stream, write_stream):
-        await mcp_server.run(
-            read_stream, write_stream, mcp_server.create_initialization_options()
-        )
+        mcp_server.run(transport="stdio")
 
 
 __all__ = ["__version__", "main"]
