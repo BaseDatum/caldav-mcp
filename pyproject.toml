@@ -3,7 +3,7 @@ name = "mcp-caldav"
 version = "2.0.0"
 description = "Multi-tenant MCP server for CalDAV and ICS calendar integration"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "caldav~=3.1.0",
     "mcp[cli]>=1.8.0",
@@ -26,10 +26,18 @@ dependencies = [
     # ASGI server
     "uvicorn>=0.30.0",
     "fastapi>=0.115.0",
+    # OpenBao Vault token validation for MCP auth (shared packages)
+    "shared-mcp-auth",
+    "shared-logging",
 ]
 
 [project.scripts]
 mcp-caldav = "mcp_caldav:main"
+
+[tool.uv.sources]
+# In Docker: resolved via --build-context COPY to /packages/*
+shared-mcp-auth = { path = "/packages/shared-mcp-auth", editable = true }
+shared-logging = { path = "/packages/shared-logging", editable = true }
 
 [build-system]
 requires = ["hatchling"]

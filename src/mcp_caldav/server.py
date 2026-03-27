@@ -50,30 +50,51 @@ def _fmt(data: Any) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
+# Lazy-initialised MCP auth validator singleton.
+_mcp_validator: Any = None
+
+
 async def _get_user_id(ctx: Context) -> str:
-    """Extract user ID from the MCP request headers."""
-    settings = Settings()
-    header_name = settings.user_id_header.lower()
+    """Extract and validate user ID from the MCP request's Authorization header.
+
+    Validates the agent's OpenBao Vault token via token/lookup and extracts
+    the user_id from the entity alias (per-user ServiceAccount name).
+    """
+    from shared_mcp_auth import MCPAuthSettings, MCPAuthValidator
+    from shared_mcp_auth.validator import AuthError
+
+    # Lazy singleton — reused across requests.
+    global _mcp_validator  # noqa: PLW0603
+    if _mcp_validator is None:
+        _mcp_validator = MCPAuthValidator.from_settings(MCPAuthSettings())
 
     # FastMCP exposes the transport request's headers via the session's
     # request context.  For stateless HTTP, each request is independent.
+    authorization = None
     request_context = ctx.request_context
     if request_context and hasattr(request_context, "request"):
         req = request_context.request
         if hasattr(req, "headers"):
-            user_id = req.headers.get(header_name)
-            if user_id:
-                return user_id
+            authorization = req.headers.get("authorization")
 
     # Fallback: check the meta headers on the session.
-    if request_context and hasattr(request_context, "meta") and request_context.meta:
-        meta = request_context.meta
-        if hasattr(meta, "headers") and meta.headers:
-            for k, v in meta.headers.items():
-                if k.lower() == header_name:
-                    return v
+    if not authorization:
+        if (
+            request_context
+            and hasattr(request_context, "meta")
+            and request_context.meta
+        ):
+            meta = request_context.meta
+            if hasattr(meta, "headers") and meta.headers:
+                for k, v in meta.headers.items():
+                    if k.lower() == "authorization":
+                        authorization = v
+                        break
 
-    raise ValueError(f"Missing {settings.user_id_header} header — cannot identify user")
+    try:
+        return _mcp_validator.extract_user_id_from_request(authorization)
+    except AuthError as e:
+        raise ValueError(str(e))
 
 
 async def _load_sources(ctx: Context) -> tuple[str, list[CalendarSource]]:
